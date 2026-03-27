@@ -8,9 +8,6 @@
   Monitor your Claude Code token usage in real-time from the macOS menu bar
 </p>
 
-<p align="center">
-  <img src="imgs/today.jpg" width="280">
-</p>
 
 ## Features
 
