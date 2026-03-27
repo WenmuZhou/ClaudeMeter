@@ -22,12 +22,12 @@ xcuserdata/
 .LSOverride
 ._*
 
-# Build products
-*.app
+# Build products (in project root)
+/*.app
+/*.zip
 *.ipa
 *.dSYM.zip
 *.dSYM
-*.zip
 *.dmg
 
 # Swift Package Manager

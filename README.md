@@ -37,8 +37,8 @@
 
 ### Option 1: Download
 
-1. Download `ClaudeMeter.app` from [Releases](https://github.com/WenmuZhou/ClaudeMeter/releases)
-2. Move to your Applications folder
+1. Download `ClaudeMeter-v1.0.0-macos-arm64.zip` from [Releases](https://github.com/WenmuZhou/ClaudeMeter/releases)
+2. Unzip and move `ClaudeMeter.app` to your Applications folder
 3. On first launch, right-click → Open (to bypass Gatekeeper)
 
 ### Option 2: Build from Source
