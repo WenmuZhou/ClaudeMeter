@@ -10,6 +10,23 @@
 
 import Foundation
 import Combine
+import SwiftData
+
+// MARK: - Usage Entry (Top-level for DataStore access)
+
+struct UsageEntry {
+    let timestamp: String
+    let date: String  // YYYY-MM-DD
+    let month: String // YYYY-MM
+    let project: String
+    let model: String
+    let inputTokens: Int
+    let outputTokens: Int
+    let cacheCreationTokens: Int
+    let cacheReadTokens: Int
+    let costUSD: Double
+    let uniqueHash: String? // messageId:requestId for deduplication
+}
 
 class UsageManager: ObservableObject {
     // MARK: - Published Data
@@ -59,22 +76,6 @@ class UsageManager: ObservableObject {
         var total: Int { input + output + cacheCreation + cacheRead }
     }
 
-    // MARK: - Usage Entry (Internal)
-
-    private struct UsageEntry {
-        let timestamp: String
-        let date: String  // YYYY-MM-DD
-        let month: String // YYYY-MM
-        let project: String
-        let model: String
-        let inputTokens: Int
-        let outputTokens: Int
-        let cacheCreationTokens: Int
-        let cacheReadTokens: Int
-        let costUSD: Double
-        let uniqueHash: String? // messageId:requestId for deduplication
-    }
-
     // MARK: - Private Properties
 
     private let iso8601Formatter: ISO8601DateFormatter = {
@@ -85,7 +86,6 @@ class UsageManager: ObservableObject {
 
     // Cache for file modification dates
     private var fileModificationCache: [String: Date] = [:]
-    private var fileResultsCache: [String: [UsageEntry]] = [:]
 
     // Store all entries for filtering
     private var allEntries: [UsageEntry] = []
@@ -107,12 +107,13 @@ class UsageManager: ObservableObject {
     // MARK: - Data Loading
 
     private func loadLocalData() {
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        Task.detached(priority: .userInitiated) { [weak self] in
             guard let self = self else { return }
 
             // Clear cache for fresh data
-            self.fileModificationCache.removeAll()
-            self.fileResultsCache.removeAll()
+            await MainActor.run {
+                self.fileModificationCache.removeAll()
+            }
 
             print("[UsageManager] Starting data load from Claude directories")
 
@@ -143,10 +144,8 @@ class UsageManager: ObservableObject {
             print("[UsageManager] Found \(allFiles.count) JSONL files")
 
             if allFiles.isEmpty {
-                DispatchQueue.main.async {
-                    self.isLoading = false
-                    self.onLoadingStateChanged?(false)
-                }
+                // Read from database even if no files (for persisted historical data)
+                await self.readFromDatabaseAndAggregate()
                 return
             }
 
@@ -166,11 +165,134 @@ class UsageManager: ObservableObject {
 
             print("[UsageManager] Total entries after deduplication: \(allEntries.count)")
 
-            // Store all entries for filtering
-            self.allEntries = allEntries
+            // Upsert to database
+            await sharedDataStore.upsertEntries(allEntries)
 
-            // Aggregate data
-            self.aggregateData(entries: allEntries)
+            // Read from database and aggregate
+            await self.readFromDatabaseAndAggregate()
+        }
+    }
+
+    private func readFromDatabaseAndAggregate() async {
+        let dataStore = sharedDataStore
+
+        // Read all summaries from database
+        let dailySummaries = await dataStore.fetchAllDailySummaries()
+        let monthlySummaries = await dataStore.fetchAllMonthlySummaries()
+        let projectSummaries = await dataStore.fetchAllProjectSummaries()
+        let modelSummaries = await dataStore.fetchAllModelSummaries()
+
+        // Convert to published data format
+        await MainActor.run {
+            // Daily data
+            self.dailyData = dailySummaries.map { (date: $0.date, tokens: $0.totalTokens) }
+
+            // Monthly data
+            self.monthlyData = monthlySummaries.map { summary in
+                let breakdown = TokenBreakdown(
+                    input: summary.inputTokens,
+                    cacheCreation: summary.cacheCreationTokens,
+                    cacheRead: summary.cacheReadTokens,
+                    output: summary.outputTokens
+                )
+                return (month: summary.month, cost: summary.costUSD, details: breakdown)
+            }
+
+            // Project data (aggregate all months)
+            var projectMap: [String: (displayName: String, cost: Double, breakdown: TokenBreakdown)] = [:]
+            for summary in projectSummaries {
+                var existing = projectMap[summary.project] ?? (displayName: summary.displayName, cost: 0.0, breakdown: TokenBreakdown())
+                existing.cost += summary.costUSD
+                existing.breakdown.input += summary.inputTokens
+                existing.breakdown.output += summary.outputTokens
+                existing.breakdown.cacheCreation += summary.cacheCreationTokens
+                existing.breakdown.cacheRead += summary.cacheReadTokens
+                projectMap[summary.project] = existing
+            }
+            self.projectData = projectMap.map { project, data in
+                ProjectData(
+                    displayName: data.displayName,
+                    originalName: project,
+                    cost: data.cost,
+                    details: data.breakdown
+                )
+            }.sorted { $0.details.total > $1.details.total }
+
+            // Model data (aggregate all months)
+            var modelMap: [String: (cost: Double, breakdown: TokenBreakdown)] = [:]
+            for summary in modelSummaries {
+                var existing = modelMap[summary.model] ?? (cost: 0.0, breakdown: TokenBreakdown())
+                existing.cost += summary.costUSD
+                existing.breakdown.input += summary.inputTokens
+                existing.breakdown.output += summary.outputTokens
+                existing.breakdown.cacheCreation += summary.cacheCreationTokens
+                existing.breakdown.cacheRead += summary.cacheReadTokens
+                modelMap[summary.model] = existing
+            }
+            self.modelData = modelMap.map { model, data in
+                (model: model, cost: data.cost, details: data.breakdown)
+            }.sorted { $0.details.total > $1.details.total }
+
+            // Today's data
+            let todayStr = self.getCurrentDateKey()
+            let todayDaily = dailySummaries.first { $0.date == todayStr }
+            self.todayBreakdown = TokenBreakdown(
+                input: todayDaily?.inputTokens ?? 0,
+                cacheCreation: todayDaily?.cacheCreationTokens ?? 0,
+                cacheRead: todayDaily?.cacheReadTokens ?? 0,
+                output: todayDaily?.outputTokens ?? 0
+            )
+
+            // Today's projects (from current month's project summaries)
+            let currentMonth = self.getCurrentMonthKey()
+            let todayProjectSummaries = projectSummaries.filter { $0.month == currentMonth }
+            self.todayProjectData = todayProjectSummaries.map { summary in
+                ProjectData(
+                    displayName: summary.displayName,
+                    originalName: summary.project,
+                    cost: summary.costUSD,
+                    details: TokenBreakdown(
+                        input: summary.inputTokens,
+                        cacheCreation: summary.cacheCreationTokens,
+                        cacheRead: summary.cacheReadTokens,
+                        output: summary.outputTokens
+                    )
+                )
+            }.sorted { $0.details.total > $1.details.total }
+
+            // Today's models (from current month's model summaries)
+            let todayModelSummaries = modelSummaries.filter { $0.month == currentMonth }
+            self.todayModelData = todayModelSummaries.map { summary in
+                (
+                    model: summary.model,
+                    cost: summary.costUSD,
+                    details: TokenBreakdown(
+                        input: summary.inputTokens,
+                        cacheCreation: summary.cacheCreationTokens,
+                        cacheRead: summary.cacheReadTokens,
+                        output: summary.outputTokens
+                    )
+                )
+            }.sorted { $0.details.total > $1.details.total }
+
+            // Calculate totals
+            self.currentMonthCost = monthlySummaries.first { $0.month == currentMonth }?.costUSD ?? 0.0
+            self.totalCost = monthlySummaries.reduce(0) { $0 + $1.costUSD }
+
+            self.dataSource = .local
+            self.lastUpdate = Date()
+            self.isLoading = false
+            self.onLoadingStateChanged?(false)
+            self.onDataUpdated?()
+
+            print("[UsageManager] Aggregation complete:")
+            print("  - Daily data: \(self.dailyData.count) days")
+            print("  - Monthly data: \(self.monthlyData.count) months")
+            print("  - Project data: \(self.projectData.count) projects")
+            print("  - Model data: \(self.modelData.count) models")
+            print("  - Today projects: \(self.todayProjectData.count)")
+            print("  - Today models: \(self.todayModelData.count)")
+            print("  - Total cost: $\(String(format: "%.4f", self.totalCost))")
         }
     }
 
@@ -181,32 +303,7 @@ class UsageManager: ObservableObject {
         project: String,
         processedHashes: inout Set<String>
     ) -> [UsageEntry] {
-        let fileKey = filePath.path
-
-        // Check cache
-        if let attributes = try? FileManager.default.attributesOfItem(atPath: fileKey),
-           let modDate = attributes[.modificationDate] as? Date {
-            if let cachedDate = fileModificationCache[fileKey],
-               let cachedResult = fileResultsCache[fileKey],
-               modDate <= cachedDate {
-                // File unchanged, but still need to check against global processedHashes
-                var newEntries: [UsageEntry] = []
-                for entry in cachedResult {
-                    if let hash = entry.uniqueHash {
-                        if !processedHashes.contains(hash) {
-                            processedHashes.insert(hash)
-                            newEntries.append(entry)
-                        }
-                    } else {
-                        newEntries.append(entry)
-                    }
-                }
-                return newEntries
-            }
-            fileModificationCache[fileKey] = modDate
-        }
-
-        guard let content = try? String(contentsOf: filePath) else { return [] }
+        guard let content = try? String(contentsOf: filePath, encoding: .utf8) else { return [] }
         let lines = content.components(separatedBy: .newlines)
 
         var entries: [UsageEntry] = []
@@ -255,9 +352,6 @@ class UsageManager: ObservableObject {
                 entries.append(tuple.entry)
             }
         }
-
-        // Cache results
-        fileResultsCache[fileKey] = entries
 
         return entries
     }
