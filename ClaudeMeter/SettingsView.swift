@@ -13,48 +13,44 @@ struct SettingsView: View {
     var onBack: (() -> Void)? = nil
 
     var body: some View {
-        ZStack {
-            Color(hex: "0f0f1a").ignoresSafeArea()
-
-            VStack(spacing: 0) {
-                // Header with back button
-                HStack {
-                    Button {
-                        onBack?()
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "chevron.left")
-                                .font(.system(size: 11, weight: .semibold))
-                            Text("返回")
-                                .font(.system(size: 11, weight: .medium))
-                        }
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(
-                            RoundedRectangle(cornerRadius: 6)
-                                .fill(Color.white.opacity(0.08))
-                        )
+        VStack(spacing: 0) {
+            // Header with back button
+            HStack {
+                Button {
+                    onBack?()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: 11, weight: .semibold))
+                        Text("返回")
+                            .font(.system(size: 11, weight: .medium))
                     }
-                    .buttonStyle(.plain)
-
-                    Spacer()
-
-                    Text("设置")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundColor(.white)
-
-                    Spacer()
-
-                    // Invisible spacer for balance
-                    Color.clear
-                        .frame(width: 50)
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6)
+                            .fill(Color.white.opacity(0.08))
+                    )
                 }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 12)
-                .background(Color(hex: "1a1a2e"))
+                .buttonStyle(.plain)
 
-                ScrollView {
+                Spacer()
+
+                Text("设置")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(.white)
+
+                Spacer()
+
+                Color.clear
+                    .frame(width: 50)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+            .background(Color(hex: "1a1a2e"))
+
+            ScrollView {
                 VStack(spacing: 16) {
                     // 通用设置
                     SettingsSection(title: "通用", icon: "gearshape.2.fill") {
@@ -221,12 +217,11 @@ struct SettingsView: View {
                 .padding(20)
             }
         }
+        .background(Color(hex: "0f0f1a"))
         .onAppear {
             checkNotificationStatus()
         }
     }
-}
-
 
     private func setLaunchAtLogin(_ enabled: Bool) {
         do {

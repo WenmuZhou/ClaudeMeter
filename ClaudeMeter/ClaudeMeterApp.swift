@@ -13,8 +13,11 @@ struct ClaudeMeterApp: App {
     }
 
     var body: some Scene {
-        // Settings are now embedded in the popover
-        WindowGroup {}
+        WindowGroup {
+            EmptyView()
+        }
+        .windowStyle(.hiddenTitleBar)
+        .defaultSize(width: 0, height: 0)
     }
 }
 
@@ -26,6 +29,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
         // Set up notification center delegate
         UNUserNotificationCenter.current().delegate = self
+
+        // Close any auto-created windows (menu bar app only)
+        NSApplication.shared.windows.forEach { $0.close() }
 
         statusBarController = StatusBarController()
     }
