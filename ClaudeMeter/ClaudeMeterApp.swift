@@ -13,9 +13,8 @@ struct ClaudeMeterApp: App {
     }
 
     var body: some Scene {
-        Settings {
-            SettingsView()
-        }
+        // Settings are now embedded in the popover
+        WindowGroup {}
     }
 }
 

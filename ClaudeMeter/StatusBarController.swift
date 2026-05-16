@@ -53,9 +53,6 @@ class StatusBarController: ObservableObject {
         popover.contentViewController = NSHostingController(
             rootView: PopoverView(
                 usageManager: usageManager,
-                onOpenSettings: { [weak self] in
-                    self?.openSettings()
-                },
                 onQuit: {
                     NSApplication.shared.terminate(nil)
                 }
@@ -96,12 +93,6 @@ class StatusBarController: ObservableObject {
 
         menu.addItem(NSMenuItem.separator())
 
-        let settingsItem = NSMenuItem(title: "设置...", action: #selector(openSettingsFromMenu), keyEquivalent: ",")
-        settingsItem.target = self
-        menu.addItem(settingsItem)
-
-        menu.addItem(NSMenuItem.separator())
-
         let quitItem = NSMenuItem(title: "退出 ClaudeMeter", action: #selector(quitApp), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
@@ -114,10 +105,6 @@ class StatusBarController: ObservableObject {
     @objc func refreshFromMenu() {
         usageManager.loadData(showLoading: false)
         updateStatusItemTitle()
-    }
-
-    @objc func openSettingsFromMenu() {
-        openSettings()
     }
 
     @objc func quitApp() {
@@ -231,25 +218,6 @@ class StatusBarController: ObservableObject {
             NSEvent.removeMonitor(monitor)
             clickMonitor = nil
         }
-    }
-
-    func openSettings() {
-        popover.performClose(nil)
-        removeClickMonitor()
-
-        NSApp.activate(ignoringOtherApps: true)
-
-        let settingsView = SettingsView()
-        let hostingController = NSHostingController(rootView: settingsView)
-
-        let window = NSWindow(contentViewController: hostingController)
-        window.title = "设置"
-        window.styleMask = [.titled, .closable]
-        window.titlebarAppearsTransparent = true
-        window.backgroundColor = NSColor(hex: "0f0f1a")
-        window.isOpaque = false
-        window.center()
-        window.makeKeyAndOrderFront(nil)
     }
 }
 

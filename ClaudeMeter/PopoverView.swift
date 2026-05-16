@@ -44,13 +44,13 @@ struct ModelData: Identifiable {
 
 struct PopoverView: View {
     @ObservedObject var usageManager: UsageManager
-    var onOpenSettings: () -> Void
     var onQuit: () -> Void
 
     @State private var selectedTab: Int = 0
     @State private var viewMode: Int = 0  // 0 = today, 1 = history
     @State private var selectedMonth: String? = nil  // nil = all, or "2026-03" etc.
     @State private var showMonthPicker: Bool = false
+    @State private var showSettings: Bool = false
 
     // MARK: - Computed Properties
 
@@ -134,30 +134,35 @@ struct PopoverView: View {
     // MARK: - Body
 
     var body: some View {
-        VStack(spacing: 0) {
-            // Header
-            headerView
+        ZStack {
+            // Main page
+            VStack(spacing: 0) {
+                headerView
 
-            // Content
-            ScrollView(showsIndicators: false) {
-                VStack(spacing: 16) {
-                    // Main Stats Card
-                    mainStatsCard
-
-                    // Daily Chart
-                    chartSection
-
-                    // Tab Content
-                    tabContentSection
+                ScrollView(showsIndicators: false) {
+                    VStack(spacing: 16) {
+                        mainStatsCard
+                        chartSection
+                        tabContentSection
+                    }
+                    .padding(16)
                 }
-                .padding(16)
-            }
 
-            // Footer
-            footerView
+                footerView
+            }
+            .offset(x: showSettings ? -360 : 0)
+
+            // Settings page
+            SettingsView(onBack: {
+                withAnimation(.easeInOut(duration: 0.25)) {
+                    showSettings = false
+                }
+            })
+            .offset(x: showSettings ? 0 : 360)
         }
         .frame(width: 360, height: 540)
         .background(Color(hex: "0f0f1a"))
+        .clipped()
     }
 
     // MARK: - Header
@@ -823,7 +828,9 @@ struct PopoverView: View {
             .opacity(usageManager.isLoading ? 0.5 : 1)
 
             Button {
-                onOpenSettings()
+                withAnimation(.easeInOut(duration: 0.25)) {
+                    showSettings = true
+                }
             } label: {
                 HStack(spacing: 4) {
                     Image(systemName: "gearshape.fill")
