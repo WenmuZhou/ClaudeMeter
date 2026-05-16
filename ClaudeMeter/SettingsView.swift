@@ -216,6 +216,7 @@ struct SettingsView: View {
                 }
                 .padding(20)
             }
+            .frame(maxHeight: .infinity)
         }
         .background(Color(hex: "0f0f1a"))
         .onAppear {

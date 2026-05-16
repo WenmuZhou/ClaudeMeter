@@ -84,9 +84,6 @@ class UsageManager: ObservableObject {
         return formatter
     }()
 
-    // Cache for file modification dates
-    private var fileModificationCache: [String: Date] = [:]
-
     // Store all entries for filtering
     private var allEntries: [UsageEntry] = []
 
@@ -110,11 +107,6 @@ class UsageManager: ObservableObject {
         Task.detached(priority: .userInitiated) { [weak self] in
             guard let self = self else { return }
 
-            // Clear cache for fresh data
-            await MainActor.run {
-                self.fileModificationCache.removeAll()
-            }
-
             print("[UsageManager] Starting data load from Claude directories")
 
             // Get all Claude data directories (XDG + legacy)
@@ -130,7 +122,6 @@ class UsageManager: ObservableObject {
                 }
                 for project in projects {
                     let projectPath = projectsPath.appendingPathComponent(project)
-                    // Recursively find all .jsonl files in project directory
                     if let enumerator = FileManager.default.enumerator(at: projectPath, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
                         for case let fileURL as URL in enumerator {
                             if fileURL.pathExtension == "jsonl" {
@@ -142,12 +133,6 @@ class UsageManager: ObservableObject {
             }
 
             print("[UsageManager] Found \(allFiles.count) JSONL files")
-
-            if allFiles.isEmpty {
-                // Read from database even if no files (for persisted historical data)
-                await self.readFromDatabaseAndAggregate()
-                return
-            }
 
             // Track processed hashes for deduplication (global across all files)
             var processedHashes = Set<String>()
@@ -165,7 +150,8 @@ class UsageManager: ObservableObject {
 
             print("[UsageManager] Total entries after deduplication: \(allEntries.count)")
 
-            // Upsert to database
+            // Clear database and re-insert all entries
+            await sharedDataStore.clearAllData()
             await sharedDataStore.upsertEntries(allEntries)
 
             // Read from database and aggregate

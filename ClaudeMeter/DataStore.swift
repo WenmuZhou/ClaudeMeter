@@ -143,7 +143,16 @@ actor DataStore {
 
     // MARK: - Update Operations
 
-    /// 增量更新：添加新的条目到数据库
+    /// 清空所有汇总数据
+    func clearAllData() {
+        try? modelContext.delete(model: DailySummary.self)
+        try? modelContext.delete(model: MonthlySummary.self)
+        try? modelContext.delete(model: ProjectSummary.self)
+        try? modelContext.delete(model: ModelSummary.self)
+        try? modelContext.save()
+    }
+
+    /// 写入条目到数据库（需先调用 clearAllData）
     func upsertEntries(_ entries: [UsageEntry]) {
         for entry in entries {
             // 更新每日汇总
