@@ -158,6 +158,7 @@ struct PopoverView: View {
                     showSettings = false
                 }
             })
+            .frame(width: 360, height: 540)
             .offset(x: showSettings ? 0 : 360)
         }
         .frame(width: 360, height: 540)
