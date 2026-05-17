@@ -8,6 +8,9 @@ struct ModelPricing {
 }
 
 enum PricingManager {
+    /// 默认兜底单价（按 Sonnet）。当模型完全不在表里时返回这个，避免 crash。
+    static let defaultPricing = ModelPricing(inputPrice: 3.0, outputPrice: 15.0, cacheCreation: 3.75, cacheRead: 0.30)
+
     static let pricingTiers: [String: ModelPricing] = [
         // Claude 4.5/4.6 models
         "claude-opus-4-6": ModelPricing(inputPrice: 15.0, outputPrice: 75.0, cacheCreation: 18.75, cacheRead: 1.50),
@@ -29,24 +32,23 @@ enum PricingManager {
         "claude-3-haiku-20240307": ModelPricing(inputPrice: 0.25, outputPrice: 1.25, cacheCreation: 0.30, cacheRead: 0.03),
     ]
 
+    /// 模糊匹配定价。先精确查表，再按 family 关键字匹配，最后兜底用 Sonnet。
+    /// 全程 `??`，绝不会 crash。
     static func getPricing(for model: String) -> ModelPricing {
-        // Try exact match first
         if let pricing = pricingTiers[model] {
             return pricing
         }
 
-        // Try partial match (e.g., "opus" in model name)
-        let lowercasedModel = model.lowercased()
-        if lowercasedModel.contains("opus") {
-            return pricingTiers["claude-opus-4-6"]!
-        } else if lowercasedModel.contains("sonnet") {
-            return pricingTiers["claude-sonnet-4-6"]!
-        } else if lowercasedModel.contains("haiku") {
-            return pricingTiers["claude-haiku-4-5-20251001"]!
+        let lower = model.lowercased()
+        if lower.contains("opus") {
+            return pricingTiers["claude-opus-4-6"] ?? defaultPricing
+        } else if lower.contains("sonnet") {
+            return pricingTiers["claude-sonnet-4-6"] ?? defaultPricing
+        } else if lower.contains("haiku") {
+            return pricingTiers["claude-haiku-4-5-20251001"] ?? defaultPricing
         }
 
-        // Default to Sonnet pricing if unknown
-        return pricingTiers["claude-sonnet-4-6"]!
+        return defaultPricing
     }
 
     static func calculateCost(input: Int, cacheCreation: Int, cacheRead: Int, output: Int, model: String) -> Double {

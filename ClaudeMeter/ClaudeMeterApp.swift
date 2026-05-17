@@ -2,7 +2,7 @@ import SwiftUI
 import UserNotifications
 import os.log
 
-private let appLogger = Logger(subsystem: "com.personal.ClaudeMeter", category: "ClaudeMeterApp")
+private let appLogger = Logging.logger("ClaudeMeterApp")
 
 @main
 struct ClaudeMeterApp: App {
@@ -13,11 +13,11 @@ struct ClaudeMeterApp: App {
     }
 
     var body: some Scene {
-        WindowGroup {
+        // Settings scene 不会自动创建可见窗口，配合 Info.plist 的 LSUIElement=YES
+        // 实现纯菜单栏 app —— 既不显示 Dock 图标，启动时也没有白窗闪烁。
+        Settings {
             EmptyView()
         }
-        .windowStyle(.hiddenTitleBar)
-        .defaultSize(width: 0, height: 0)
     }
 }
 
@@ -30,14 +30,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         // Set up notification center delegate
         UNUserNotificationCenter.current().delegate = self
 
-        // Close any auto-created windows (menu bar app only)
-        NSApplication.shared.windows.forEach { $0.close() }
-
         statusBarController = StatusBarController()
-    }
-
-    func applicationShouldOpenUntitledWindow(_ sender: NSApplication) -> Bool {
-        false
     }
 
     // Show notification even when app is in foreground

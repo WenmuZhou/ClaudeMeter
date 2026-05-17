@@ -4,51 +4,52 @@ import UserNotifications
 import AppKit
 import os.log
 
-private let logger = Logger(subsystem: "com.personal.ClaudeMeter", category: "SettingsView")
+private let logger = Logging.logger("SettingsView")
 
 struct SettingsView: View {
     @ObservedObject var settings = SettingsManager.shared
     @State private var notificationStatus: String = "检查中..."
     @State private var notificationsDenied: Bool = false
     var onBack: (() -> Void)? = nil
+    /// 外观切换「之前」回调 —— 让 PopoverView 抓旧外观快照做 crossfade。
+    var onAppearanceWillChange: (() -> Void)? = nil
 
     var body: some View {
         VStack(spacing: 0) {
             // Header with back button
-            HStack {
-                Button {
-                    onBack?()
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "chevron.left")
-                            .font(.system(size: 11, weight: .semibold))
-                        Text("返回")
-                            .font(.system(size: 11, weight: .medium))
-                    }
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .background(
-                        RoundedRectangle(cornerRadius: 6)
-                            .fill(Color.white.opacity(0.08))
-                    )
-                }
-                .buttonStyle(.plain)
-
-                Spacer()
-
+            ZStack {
                 Text("设置")
                     .font(.system(size: 13, weight: .semibold))
-                    .foregroundColor(.white)
+                    .foregroundColor(Theme.Colors.textPrimary)
+                    .frame(maxWidth: .infinity, alignment: .center)
 
-                Spacer()
+                HStack {
+                    Button {
+                        onBack?()
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: "chevron.left")
+                                .font(.system(size: 10, weight: .semibold))
+                            Text("返回")
+                                .font(.system(size: 11, weight: .medium))
+                        }
+                        .foregroundColor(Theme.Colors.textPrimary)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(
+                            RoundedRectangle(cornerRadius: 5)
+                                .fill(Theme.Colors.border)
+                        )
+                    }
+                    .buttonStyle(.plain)
 
-                Color.clear
-                    .frame(width: 50)
+                    Spacer()
+                }
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 12)
-            .background(Color(hex: "1a1a2e"))
+            .padding(.horizontal, 12)
+            .padding(.top, 10)
+            .padding(.bottom, 6)
+            .background(Theme.Colors.bgCard)
 
             ScrollView {
                 VStack(spacing: 16) {
@@ -60,7 +61,7 @@ struct SettingsView: View {
                             onChange: { setLaunchAtLogin($0) }
                         )
 
-                        Divider().background(Color.white.opacity(0.1))
+                        Divider().background(Theme.Colors.divider)
 
                         SettingsToggleRow(
                             title: "自动刷新",
@@ -72,7 +73,7 @@ struct SettingsView: View {
                             VStack(alignment: .leading, spacing: 8) {
                                 Text("刷新间隔")
                                     .font(.system(size: 11))
-                                    .foregroundColor(.white.opacity(0.5))
+                                    .foregroundColor(Theme.Colors.textTertiary)
 
                                 HStack(spacing: 6) {
                                     ForEach(settings.refreshIntervalOptions, id: \.value) { option in
@@ -81,12 +82,12 @@ struct SettingsView: View {
                                         } label: {
                                             Text(option.label)
                                                 .font(.system(size: 10, weight: .medium))
-                                                .foregroundColor(settings.refreshInterval == option.value ? .white : .white.opacity(0.5))
+                                                .foregroundColor(settings.refreshInterval == option.value ? Theme.Colors.onPrimary : Theme.Colors.textTertiary)
                                                 .frame(maxWidth: .infinity)
                                                 .padding(.vertical, 7)
                                                 .background(
                                                     RoundedRectangle(cornerRadius: 6)
-                                                        .fill(settings.refreshInterval == option.value ? Color(hex: "667eea") : Color.white.opacity(0.05))
+                                                        .fill(settings.refreshInterval == option.value ? Theme.Colors.primary : Theme.Colors.bgElevated)
                                                 )
                                         }
                                         .buttonStyle(.plain)
@@ -97,7 +98,16 @@ struct SettingsView: View {
                             .padding(.vertical, 10)
                         }
 
-                        Divider().background(Color.white.opacity(0.1))
+                        Divider().background(Theme.Colors.divider)
+
+                        SettingsPickerRow(
+                            title: "外观",
+                            options: settings.appearanceOptions,
+                            selectedValue: $settings.appearance,
+                            onWillChange: onAppearanceWillChange
+                        )
+
+                        Divider().background(Theme.Colors.divider)
 
                         SettingsPickerRow(
                             title: "状态栏显示",
@@ -105,7 +115,7 @@ struct SettingsView: View {
                             selectedValue: $settings.statusBarDisplay
                         )
 
-                        Divider().background(Color.white.opacity(0.1))
+                        Divider().background(Theme.Colors.divider)
 
                         SettingsPickerRow(
                             title: "数字格式",
@@ -123,23 +133,23 @@ struct SettingsView: View {
                         )
 
                         if settings.notificationsEnabled {
-                            Divider().background(Color.white.opacity(0.1))
+                            Divider().background(Theme.Colors.divider)
 
                             HStack {
                                 Text("通知状态")
                                     .font(.system(size: 12, weight: .medium))
-                                    .foregroundColor(.white)
+                                    .foregroundColor(Theme.Colors.textPrimary)
 
                                 Spacer()
 
                                 HStack(spacing: 10) {
                                     HStack(spacing: 4) {
                                         Circle()
-                                            .fill(notificationsDenied ? Color(hex: "ef4444") : Color(hex: "22c55e"))
+                                            .fill(notificationsDenied ? Theme.Colors.danger : Theme.Colors.success)
                                             .frame(width: 6, height: 6)
                                         Text(notificationStatus)
                                             .font(.system(size: 10))
-                                            .foregroundColor(notificationsDenied ? Color(hex: "ef4444") : Color(hex: "22c55e"))
+                                            .foregroundColor(notificationsDenied ? Theme.Colors.danger : Theme.Colors.success)
                                     }
 
                                     Button {
@@ -147,10 +157,10 @@ struct SettingsView: View {
                                     } label: {
                                         Text("测试")
                                             .font(.system(size: 10, weight: .medium))
-                                            .foregroundColor(.white)
+                                            .foregroundColor(Theme.Colors.onPrimary)
                                             .padding(.horizontal, 12)
                                             .padding(.vertical, 5)
-                                            .background(Capsule().fill(Color(hex: "667eea")))
+                                            .background(Capsule().fill(Theme.Colors.primary))
                                     }
                                     .buttonStyle(.plain)
                                 }
@@ -161,11 +171,11 @@ struct SettingsView: View {
                             if notificationsDenied {
                                 HStack {
                                     Image(systemName: "exclamationmark.triangle.fill")
-                                        .foregroundColor(Color(hex: "f59e0b"))
+                                        .foregroundColor(Theme.Colors.warning)
                                         .font(.system(size: 11))
                                     Text("通知权限被拒绝，请在系统设置中允许")
                                         .font(.system(size: 11))
-                                        .foregroundColor(.white.opacity(0.6))
+                                        .foregroundColor(Theme.Colors.textSecondary)
                                     Spacer()
                                     Button {
                                         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.notifications") {
@@ -174,13 +184,13 @@ struct SettingsView: View {
                                     } label: {
                                         Text("设置")
                                             .font(.system(size: 10))
-                                            .foregroundColor(Color(hex: "667eea"))
+                                            .foregroundColor(Theme.Colors.primary)
                                     }
                                     .buttonStyle(.plain)
                                 }
                                 .padding(.horizontal, 16)
                                 .padding(.vertical, 10)
-                                .background(Color(hex: "f59e0b").opacity(0.1))
+                                .background(Theme.Colors.warning.opacity(0.1))
                             }
                         }
                     }
@@ -190,36 +200,44 @@ struct SettingsView: View {
                         HStack {
                             Text("版本")
                                 .font(.system(size: 12))
-                                .foregroundColor(.white.opacity(0.7))
+                                .foregroundColor(Theme.Colors.textSecondary)
                             Spacer()
                             Text("1.0.0")
                                 .font(.system(size: 12, weight: .medium, design: .monospaced))
-                                .foregroundColor(Color(hex: "667eea"))
+                                .foregroundColor(Theme.Colors.primary)
                         }
                         .padding(.horizontal, 16)
                         .padding(.vertical, 12)
 
-                        Divider().background(Color.white.opacity(0.1))
+                        Divider().background(Theme.Colors.divider)
 
                         HStack {
                             Text("数据源")
                                 .font(.system(size: 12))
-                                .foregroundColor(.white.opacity(0.7))
+                                .foregroundColor(Theme.Colors.textSecondary)
                             Spacer()
                             Text("~/.claude/projects")
                                 .font(.system(size: 11, design: .monospaced))
-                                .foregroundColor(.white.opacity(0.5))
+                                .foregroundColor(Theme.Colors.textTertiary)
                         }
                         .padding(.horizontal, 16)
                         .padding(.vertical, 12)
                     }
                 }
-                .padding(20)
+                .padding(.horizontal, 16)
+                .padding(.top, 12)
+                .padding(.bottom, 20)
             }
             .frame(maxHeight: .infinity)
         }
-        .background(Color(hex: "0f0f1a"))
+        .background(Theme.Colors.bgBase)
         .onAppear {
+            checkNotificationStatus()
+        }
+        // 用户去 macOS 系统设置改完通知权限再回到 app 时，重新检查状态。
+        // SettingsView 一直挂在 PopoverView 的 ZStack 里靠 offset 切显隐，
+        // .onAppear 一辈子只跑一次，必须靠 NotificationCenter 主动 refresh。
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             checkNotificationStatus()
         }
     }
@@ -337,16 +355,16 @@ struct SettingsSection<Content: View>: View {
             HStack(spacing: 6) {
                 Image(systemName: icon)
                     .font(.system(size: 10, weight: .medium))
-                    .foregroundColor(Color(hex: "667eea"))
+                    .foregroundColor(Theme.Colors.primary)
                 Text(title)
                     .font(.system(size: 11, weight: .semibold))
-                    .foregroundColor(.white.opacity(0.6))
+                    .foregroundColor(Theme.Colors.textSecondary)
             }
 
             VStack(spacing: 0) {
                 content()
             }
-            .background(Color(hex: "1a1a2e"))
+            .background(Theme.Colors.bgCard)
             .cornerRadius(12)
         }
     }
@@ -363,11 +381,11 @@ struct SettingsToggleRow: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text(title)
                     .font(.system(size: 12, weight: .medium))
-                    .foregroundColor(.white)
+                    .foregroundColor(Theme.Colors.textPrimary)
                 if let subtitle = subtitle {
                     Text(subtitle)
                         .font(.system(size: 10))
-                        .foregroundColor(.white.opacity(0.4))
+                        .foregroundColor(Theme.Colors.textDisabled)
                 }
             }
             Spacer()
@@ -379,7 +397,7 @@ struct SettingsToggleRow: View {
             } label: {
                 ZStack {
                     Capsule()
-                        .fill(isOn ? Color(hex: "667eea") : Color.white.opacity(0.2))
+                        .fill(isOn ? Theme.Colors.primary : Theme.Colors.border)
                         .frame(width: 44, height: 24)
 
                     Circle()
@@ -400,26 +418,31 @@ struct SettingsPickerRow: View {
     let title: String
     let options: [(value: Int, label: String)]
     @Binding var selectedValue: Int
+    /// 值「即将」改变时回调（在写入新值之前）。仅当值真的不同才触发。
+    var onWillChange: (() -> Void)? = nil
 
     var body: some View {
         HStack {
             Text(title)
                 .font(.system(size: 12, weight: .medium))
-                .foregroundColor(.white)
+                .foregroundColor(Theme.Colors.textPrimary)
             Spacer()
             HStack(spacing: 4) {
                 ForEach(options, id: \.value) { option in
                     Button {
-                        selectedValue = option.value
+                        if selectedValue != option.value {
+                            onWillChange?()
+                            selectedValue = option.value
+                        }
                     } label: {
                         Text(option.label)
                             .font(.system(size: 10, weight: .medium))
-                            .foregroundColor(selectedValue == option.value ? .white : .white.opacity(0.5))
+                            .foregroundColor(selectedValue == option.value ? Theme.Colors.onPrimary : Theme.Colors.textTertiary)
                             .padding(.horizontal, 10)
                             .padding(.vertical, 5)
                             .background(
                                 Capsule()
-                                    .fill(selectedValue == option.value ? Color(hex: "667eea") : Color.white.opacity(0.05))
+                                    .fill(selectedValue == option.value ? Theme.Colors.primary : Theme.Colors.bgElevated)
                             )
                     }
                     .buttonStyle(.plain)

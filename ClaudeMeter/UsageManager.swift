@@ -1,16 +1,19 @@
 //
-//  ClaudeUsageManager.swift
-//  Claude Usage Tracker
+//  UsageManager.swift
+//  ClaudeMeter
 //
-//  Copyright © 2025 Sergio Bañuls. All rights reserved.
-//  Licensed under Personal Use License (Non-Commercial)
-//
-//  Refactored to match ccusage data extraction logic
+//  数据加载与聚合：
+//    - 启动时直接从 DB 读取并展示历史数据
+//    - 后续刷新走增量扫描（按文件指纹跳过未变化的）
+//    - 跨进程重启数据持久化在 SwiftData 里
 //
 
 import Foundation
 import Combine
 import SwiftData
+import os.log
+
+private let umLogger = Logging.logger("UsageManager")
 
 // MARK: - Usage Entry (Top-level for DataStore access)
 
@@ -25,7 +28,8 @@ struct UsageEntry {
     let cacheCreationTokens: Int
     let cacheReadTokens: Int
     let costUSD: Double
-    let uniqueHash: String? // messageId:requestId for deduplication
+    /// 入库唯一键。可能是 messageId:requestId，也可能是 loc:path:line 兜底。
+    let uniqueHash: String?
 }
 
 class UsageManager: ObservableObject {
@@ -42,16 +46,10 @@ class UsageManager: ObservableObject {
     @Published var totalCost: Double = 0.0
     @Published var lastUpdate: Date = Date()
     @Published var isLoading: Bool = false
-    @Published var dataSource: DataSource = .local
 
     // Available months for filtering
     var availableMonths: [String] {
         monthlyData.map { $0.month }.sorted(by: >)
-    }
-
-    enum DataSource {
-        case api
-        case local
     }
 
     // MARK: - Data Structures
@@ -63,11 +61,6 @@ class UsageManager: ObservableObject {
         let details: TokenBreakdown
     }
 
-    var onDataUpdated: (() -> Void)?
-    var onLoadingStateChanged: ((Bool) -> Void)?
-
-    // MARK: - Token Breakdown
-
     struct TokenBreakdown {
         var input: Int = 0
         var cacheCreation: Int = 0
@@ -78,226 +71,182 @@ class UsageManager: ObservableObject {
 
     // MARK: - Private Properties
 
+    /// 仅缓存一次的 formatters。`DateFormatter` 初始化是重操作，per-call 创建会很慢。
     private let iso8601Formatter: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    private let dayFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        f.locale = Locale(identifier: "en_CA")  // en-CA 默认 YYYY-MM-DD
+        return f
+    }()
+    private let monthFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM"
+        return f
+    }()
+    private let fallbackParsers: [DateFormatter] = {
+        let formats = [
+            "yyyy-MM-dd'T'HH:mm:ssZ",
+            "yyyy-MM-dd'T'HH:mm:ss.SSSZ",
+            "yyyy-MM-dd'T'HH:mm:ss",
+            "yyyy-MM-dd"
+        ]
+        return formats.map { fmt in
+            let f = DateFormatter()
+            f.locale = Locale(identifier: "en_US_POSIX")
+            f.dateFormat = fmt
+            return f
+        }
     }()
 
-    // Store all entries for filtering
+    /// 内存里的全量 entries，用于历史月份切换的 in-memory filter。
+    /// 由 aggregateAndPublish 在主线程更新，保证读写都在主线程。
     private var allEntries: [UsageEntry] = []
 
-    // MARK: - Public Methods
+    /// 当前正在跑的 refresh 任务。重复调用 loadData 时复用，避免并发扫描。
+    private var refreshTask: Task<Void, Never>?
+
+    // MARK: - Public API
 
     init() {
-        // No initialization required
+        // Boot 也走 refreshTask 链：先从 DB 出旧数据快照，再做一次增量扫描。
+        // StatusBarController.init 之后调 loadData 时会因 refreshTask 还在而 skip，
+        // 消除两个 publish 互相覆盖的 race。
+        refreshTask = Task.detached(priority: .userInitiated) { [weak self] in
+            await self?.bootFromDatabase()
+            await self?.refreshFromDisk()
+            await MainActor.run { [weak self] in
+                self?.refreshTask = nil
+            }
+        }
     }
 
     func loadData(showLoading: Bool = true) {
-        if showLoading {
-            self.isLoading = true
-            self.onLoadingStateChanged?(true)
+        // 防并发：已经在跑就直接 return，避免多次扫描堆积。
+        if let existing = refreshTask, !existing.isCancelled {
+            umLogger.debug("loadData: refresh already in flight, skipping")
+            return
         }
-        loadLocalData()
+
+        if showLoading {
+            DispatchQueue.main.async {
+                self.isLoading = true
+            }
+        }
+
+        refreshTask = Task.detached(priority: .userInitiated) { [weak self] in
+            await self?.refreshFromDisk()
+            await MainActor.run { [weak self] in
+                self?.refreshTask = nil
+            }
+        }
     }
 
-    // MARK: - Data Loading
+    /// 重置数据库，下次 loadData 会全量重建。
+    func resetDatabase() {
+        Task.detached(priority: .userInitiated) {
+            await sharedDataStore.clearAll()
+        }
+    }
 
-    private func loadLocalData() {
-        Task.detached(priority: .userInitiated) { [weak self] in
-            guard let self = self else { return }
+    // MARK: - Boot / Refresh
 
-            print("[UsageManager] Starting data load from Claude directories")
+    /// 启动路径：从 DB 读已有数据，立即聚合发布到 UI。
+    private func bootFromDatabase() async {
+        let entries = await sharedDataStore.fetchAllRawEntries()
+        umLogger.info("Boot from DB: \(entries.count) entries")
+        await aggregateAndPublish(entries: entries)
+    }
 
-            // Get all Claude data directories (XDG + legacy)
-            let claudePaths = self.getClaudePaths()
-            print("[UsageManager] Claude directories: \(claudePaths)")
+    /// 刷新路径：增量扫描磁盘 → 写入 DB → 重新聚合发布。
+    private func refreshFromDisk() async {
+        await incrementalScan()
+        let entries = await sharedDataStore.fetchAllRawEntries()
+        await aggregateAndPublish(entries: entries)
+    }
 
-            // Collect all JSONL files recursively (including subagents subdirectories)
-            var allFiles: [(project: String, file: URL)] = []
-            for claudePath in claudePaths {
-                let projectsPath = claudePath.appendingPathComponent("projects")
-                guard let projects = try? FileManager.default.contentsOfDirectory(atPath: projectsPath.path) else {
-                    continue
-                }
-                for project in projects {
-                    let projectPath = projectsPath.appendingPathComponent(project)
-                    if let enumerator = FileManager.default.enumerator(at: projectPath, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
-                        for case let fileURL as URL in enumerator {
-                            if fileURL.pathExtension == "jsonl" {
-                                allFiles.append((project: project, file: fileURL))
-                            }
-                        }
+    // MARK: - Incremental Scan
+
+    /// 同步收集所有 JSONL 文件 URL。
+    /// 抽出来是因为 NSEnumerator 不是 Sendable，不能在 async 上下文直接 for-in。
+    private func collectJSONLFiles() -> [URL] {
+        var allFiles: [URL] = []
+        for path in getClaudePaths() {
+            let projectsPath = path.appendingPathComponent("projects")
+            guard let projects = try? FileManager.default.contentsOfDirectory(atPath: projectsPath.path) else {
+                continue
+            }
+            for project in projects {
+                let projectPath = projectsPath.appendingPathComponent(project)
+                guard let enumerator = FileManager.default.enumerator(
+                    at: projectPath,
+                    includingPropertiesForKeys: nil,
+                    options: [.skipsHiddenFiles]
+                ) else { continue }
+                for case let fileURL as URL in enumerator {
+                    if fileURL.pathExtension == "jsonl" {
+                        allFiles.append(fileURL)
                     }
                 }
             }
-
-            print("[UsageManager] Found \(allFiles.count) JSONL files")
-
-            // Track processed hashes for deduplication (global across all files)
-            var processedHashes = Set<String>()
-            var allEntries: [UsageEntry] = []
-
-            // Process each file
-            for (projectName, filePath) in allFiles {
-                let entries = self.processJSONLFile(
-                    filePath: filePath,
-                    project: projectName,
-                    processedHashes: &processedHashes
-                )
-                allEntries.append(contentsOf: entries)
-            }
-
-            print("[UsageManager] Total entries after deduplication: \(allEntries.count)")
-
-            // Clear database and re-insert all entries
-            await sharedDataStore.clearAllData()
-            await sharedDataStore.upsertEntries(allEntries)
-
-            // Read from database and aggregate
-            await self.readFromDatabaseAndAggregate()
         }
+        return allFiles
     }
 
-    private func readFromDatabaseAndAggregate() async {
-        let dataStore = sharedDataStore
+    /// 扫描所有 JSONL 文件，跳过指纹未变化的，对变化文件 replace 其 entries。
+    private func incrementalScan() async {
+        let allFiles = collectJSONLFiles()
 
-        // Read all summaries from database
-        let dailySummaries = await dataStore.fetchAllDailySummaries()
-        let monthlySummaries = await dataStore.fetchAllMonthlySummaries()
-        let projectSummaries = await dataStore.fetchAllProjectSummaries()
-        let modelSummaries = await dataStore.fetchAllModelSummaries()
-
-        // Convert to published data format
-        await MainActor.run {
-            // Daily data
-            self.dailyData = dailySummaries.map { (date: $0.date, tokens: $0.totalTokens) }
-
-            // Monthly data
-            self.monthlyData = monthlySummaries.map { summary in
-                let breakdown = TokenBreakdown(
-                    input: summary.inputTokens,
-                    cacheCreation: summary.cacheCreationTokens,
-                    cacheRead: summary.cacheReadTokens,
-                    output: summary.outputTokens
-                )
-                return (month: summary.month, cost: summary.costUSD, details: breakdown)
+        // 过滤出真正需要重新解析的文件
+        var changed: [(url: URL, project: String, size: Int64, mtime: Date)] = []
+        for fileURL in allFiles {
+            guard let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+                  let size = (attrs[.size] as? NSNumber)?.int64Value,
+                  let mtime = attrs[.modificationDate] as? Date else {
+                continue
             }
+            let project = extractProjectName(from: fileURL)
 
-            // Project data (aggregate all months)
-            var projectMap: [String: (displayName: String, cost: Double, breakdown: TokenBreakdown)] = [:]
-            for summary in projectSummaries {
-                var existing = projectMap[summary.project] ?? (displayName: summary.displayName, cost: 0.0, breakdown: TokenBreakdown())
-                existing.cost += summary.costUSD
-                existing.breakdown.input += summary.inputTokens
-                existing.breakdown.output += summary.outputTokens
-                existing.breakdown.cacheCreation += summary.cacheCreationTokens
-                existing.breakdown.cacheRead += summary.cacheReadTokens
-                projectMap[summary.project] = existing
+            if let cursor = await sharedDataStore.fetchCursor(filePath: fileURL.path),
+               cursor.size == size,
+               // SwiftData 序列化 Date 可能丢精度，1ms 容差判断「同一个 mtime」
+               abs(cursor.mtime.timeIntervalSince1970 - mtime.timeIntervalSince1970) < 0.001 {
+                continue  // 文件未变化，跳过
             }
-            self.projectData = projectMap.map { project, data in
-                ProjectData(
-                    displayName: data.displayName,
-                    originalName: project,
-                    cost: data.cost,
-                    details: data.breakdown
-                )
-            }.sorted { $0.details.total > $1.details.total }
+            changed.append((url: fileURL, project: project, size: size, mtime: mtime))
+        }
 
-            // Model data (aggregate all months)
-            var modelMap: [String: (cost: Double, breakdown: TokenBreakdown)] = [:]
-            for summary in modelSummaries {
-                var existing = modelMap[summary.model] ?? (cost: 0.0, breakdown: TokenBreakdown())
-                existing.cost += summary.costUSD
-                existing.breakdown.input += summary.inputTokens
-                existing.breakdown.output += summary.outputTokens
-                existing.breakdown.cacheCreation += summary.cacheCreationTokens
-                existing.breakdown.cacheRead += summary.cacheReadTokens
-                modelMap[summary.model] = existing
-            }
-            self.modelData = modelMap.map { model, data in
-                (model: model, cost: data.cost, details: data.breakdown)
-            }.sorted { $0.details.total > $1.details.total }
+        umLogger.info("Incremental: \(changed.count)/\(allFiles.count) files need re-parse")
 
-            // Today's data
-            let todayStr = self.getCurrentDateKey()
-            let todayDaily = dailySummaries.first { $0.date == todayStr }
-            self.todayBreakdown = TokenBreakdown(
-                input: todayDaily?.inputTokens ?? 0,
-                cacheCreation: todayDaily?.cacheCreationTokens ?? 0,
-                cacheRead: todayDaily?.cacheReadTokens ?? 0,
-                output: todayDaily?.outputTokens ?? 0
+        // 对变化文件 replace（删旧+插新+更新 cursor）
+        for (fileURL, project, size, mtime) in changed {
+            var seen = Set<String>()
+            let entries = parseFile(filePath: fileURL, project: project, processedHashes: &seen)
+            await sharedDataStore.replaceEntriesForFile(
+                filePath: fileURL.path,
+                newEntries: entries,
+                fileSize: size,
+                mtime: mtime
             )
-
-            // Today's projects (from current month's project summaries)
-            let currentMonth = self.getCurrentMonthKey()
-            let todayProjectSummaries = projectSummaries.filter { $0.month == currentMonth }
-            self.todayProjectData = todayProjectSummaries.map { summary in
-                ProjectData(
-                    displayName: summary.displayName,
-                    originalName: summary.project,
-                    cost: summary.costUSD,
-                    details: TokenBreakdown(
-                        input: summary.inputTokens,
-                        cacheCreation: summary.cacheCreationTokens,
-                        cacheRead: summary.cacheReadTokens,
-                        output: summary.outputTokens
-                    )
-                )
-            }.sorted { $0.details.total > $1.details.total }
-
-            // Today's models (from current month's model summaries)
-            let todayModelSummaries = modelSummaries.filter { $0.month == currentMonth }
-            self.todayModelData = todayModelSummaries.map { summary in
-                (
-                    model: summary.model,
-                    cost: summary.costUSD,
-                    details: TokenBreakdown(
-                        input: summary.inputTokens,
-                        cacheCreation: summary.cacheCreationTokens,
-                        cacheRead: summary.cacheReadTokens,
-                        output: summary.outputTokens
-                    )
-                )
-            }.sorted { $0.details.total > $1.details.total }
-
-            // Calculate totals
-            self.currentMonthCost = monthlySummaries.first { $0.month == currentMonth }?.costUSD ?? 0.0
-            self.totalCost = monthlySummaries.reduce(0) { $0 + $1.costUSD }
-
-            self.dataSource = .local
-            self.lastUpdate = Date()
-            self.isLoading = false
-            self.onLoadingStateChanged?(false)
-            self.onDataUpdated?()
-
-            print("[UsageManager] Aggregation complete:")
-            print("  - Daily data: \(self.dailyData.count) days")
-            print("  - Monthly data: \(self.monthlyData.count) months")
-            print("  - Project data: \(self.projectData.count) projects")
-            print("  - Model data: \(self.modelData.count) models")
-            print("  - Today projects: \(self.todayProjectData.count)")
-            print("  - Today models: \(self.todayModelData.count)")
-            print("  - Total cost: $\(String(format: "%.4f", self.totalCost))")
         }
     }
 
-    // MARK: - File Processing
+    // MARK: - File Parsing
 
-    private func processJSONLFile(
-        filePath: URL,
-        project: String,
-        processedHashes: inout Set<String>
-    ) -> [UsageEntry] {
+    /// 解析单个 JSONL。所有返回的 entry 都会带上非空 uniqueHash。
+    /// 去重逻辑同 ccusage：(messageId, requestId) 都存在时按此组合去重；否则按 path:line 兜底。
+    private func parseFile(filePath: URL, project: String, processedHashes: inout Set<String>) -> [UsageEntry] {
         guard let content = try? String(contentsOf: filePath, encoding: .utf8) else { return [] }
         let lines = content.components(separatedBy: .newlines)
 
-        var entries: [UsageEntry] = []
-
-        // First pass: collect last entry per unique message.id (ccusage dedup logic)
-        // When requestId is not available, use only message.id for deduplication
-        // Key: message.id, Value: (entry, lineNumber)
-        var lastEntryForMessageId: [String: (entry: UsageEntry, lineNumber: Int)] = [:]
+        // 同一 messageId:requestId 取最后一次出现（流式响应可能多次写入，最后一次是最完整的）
+        var lastEntryForHash: [String: (entry: UsageEntry, lineNumber: Int)] = [:]
+        // 没有 messageId/requestId 的 entry：合成 path:line 作为兜底 hash
+        var unhashedEntries: [(entry: UsageEntry, lineNumber: Int)] = []
         var lineNumber = 0
 
         for line in lines where !line.isEmpty {
@@ -306,55 +255,61 @@ class UsageManager: ObservableObject {
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 continue
             }
-
-            // Parse the entry
             guard let entry = parseUsageEntry(json: json, project: project) else {
                 continue
             }
-
-            // Deduplication logic (matching ccusage):
-            // - If message.id exists, keep the last entry for each message.id
-            // - If message.id is nil, include all entries (no dedup)
-            if let messageId = entry.uniqueHash {
-                // Has message.id - keep only the last one
-                if let existing = lastEntryForMessageId[messageId] {
-                    // Replace if this is a later entry (more complete due to streaming)
+            if let h = entry.uniqueHash {
+                if let existing = lastEntryForHash[h] {
                     if lineNumber > existing.lineNumber {
-                        lastEntryForMessageId[messageId] = (entry: entry, lineNumber: lineNumber)
+                        lastEntryForHash[h] = (entry, lineNumber)
                     }
                 } else {
-                    lastEntryForMessageId[messageId] = (entry: entry, lineNumber: lineNumber)
+                    lastEntryForHash[h] = (entry, lineNumber)
                 }
             } else {
-                // No message.id - include directly (no dedup)
-                entries.append(entry)
+                unhashedEntries.append((entry, lineNumber))
             }
         }
 
-        // Add deduplicated entries that haven't been processed globally
-        for (messageId, tuple) in lastEntryForMessageId {
-            if !processedHashes.contains(messageId) {
-                processedHashes.insert(messageId)
-                entries.append(tuple.entry)
+        var result: [UsageEntry] = []
+
+        // 跨文件去重：本次扫描中其他文件已处理过此 hash 则跳过
+        for (h, tuple) in lastEntryForHash {
+            if !processedHashes.contains(h) {
+                processedHashes.insert(h)
+                result.append(tuple.entry)
             }
         }
 
-        return entries
+        // 合成兜底 hash，让每条无 id 的 entry 也能进 DB
+        for (entry, line) in unhashedEntries {
+            let synthHash = "loc:\(filePath.path):\(line)"
+            result.append(UsageEntry(
+                timestamp: entry.timestamp,
+                date: entry.date,
+                month: entry.month,
+                project: entry.project,
+                model: entry.model,
+                inputTokens: entry.inputTokens,
+                outputTokens: entry.outputTokens,
+                cacheCreationTokens: entry.cacheCreationTokens,
+                cacheReadTokens: entry.cacheReadTokens,
+                costUSD: entry.costUSD,
+                uniqueHash: synthHash
+            ))
+        }
+
+        return result
     }
 
     private func parseUsageEntry(json: [String: Any], project: String) -> UsageEntry? {
-        // Extract timestamp
-        guard let timestamp = json["timestamp"] as? String else {
-            return nil
-        }
+        guard let timestamp = json["timestamp"] as? String else { return nil }
 
-        // Extract message
         guard let message = json["message"] as? [String: Any],
               let usage = message["usage"] as? [String: Any] else {
             return nil
         }
 
-        // Extract usage tokens
         let inputTokens = usage["input_tokens"] as? Int ?? 0
         let outputTokens = usage["output_tokens"] as? Int ?? 0
         let cacheCreationTokens = usage["cache_creation_input_tokens"] as? Int ?? 0
@@ -365,34 +320,25 @@ class UsageManager: ObservableObject {
             return nil
         }
 
-        // Extract model name (inside message object, like ccusage)
         var model = message["model"] as? String ?? "unknown"
-
-        // Check for fast mode (ccusage logic)
         if let speed = usage["speed"] as? String, speed == "fast" {
             model = "\(model)-fast"
         }
 
-        // Extract cost (prefer costUSD, like ccusage in 'auto' mode)
         let costUSD = json["costUSD"] as? Double ?? 0.0
 
-        // Extract message ID and request ID for deduplication (ccusage logic)
-        // ccusage only deduplicates when BOTH messageId AND requestId are present
-        // If either is null, the entry is NOT deduplicated
+        // ccusage dedup: 仅当 (messageId, requestId) 都存在时去重
         let messageId = message["id"] as? String
         let requestId = json["requestId"] as? String
 
-        // Create unique hash only if both are present and non-empty (matching ccusage)
         let uniqueHash: String?
         if let messageId = messageId, !messageId.isEmpty,
            let requestId = requestId, !requestId.isEmpty {
-            uniqueHash = "\(messageId):\(requestId)"
+            uniqueHash = "id:\(messageId):\(requestId)"
         } else {
-            // If either is missing/null, no deduplication (per ccusage logic)
             uniqueHash = nil
         }
 
-        // Format date using ccusage's formatDate logic
         let date = formatDateFromTimestamp(timestamp)
         let month = String(date.prefix(7))
 
@@ -411,161 +357,134 @@ class UsageManager: ObservableObject {
         )
     }
 
-    // MARK: - Data Aggregation
+    // MARK: - Aggregation
 
-    private func aggregateData(entries: [UsageEntry]) {
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
+    /// 单次扫描所有 entries，一次性聚合出 daily / monthly / project / model / today 数据。
+    /// 全部计算在 background，最后一次性 dispatch 到 main 更新 @Published。
+    private func aggregateAndPublish(entries: [UsageEntry]) async {
+        let todayStr = getCurrentDateKey()
+        let currentMonth = getCurrentMonthKey()
 
-            print("[UsageManager] Aggregating \(entries.count) entries")
+        var dailyMap: [String: Int] = [:]
+        var monthlyMap: [String: TokenBreakdown] = [:]
+        var monthlyCost: [String: Double] = [:]
+        var projectMap: [String: TokenBreakdown] = [:]
+        var projectCost: [String: Double] = [:]
+        var modelMap: [String: TokenBreakdown] = [:]
+        var modelCost: [String: Double] = [:]
+        var todayProjectMap: [String: TokenBreakdown] = [:]
+        var todayProjectCost: [String: Double] = [:]
+        var todayModelMap: [String: TokenBreakdown] = [:]
+        var todayModelCost: [String: Double] = [:]
+        var todayBd = TokenBreakdown()
 
-            // Get today's date string
-            let todayStr = self.getCurrentDateKey()
+        for e in entries {
+            let total = e.inputTokens + e.outputTokens + e.cacheCreationTokens + e.cacheReadTokens
+            let cost = entryCost(e)
+            dailyMap[e.date, default: 0] += total
 
-            // Aggregate by date (daily data)
-            var dailyMap: [String: Int] = [:]
-            for entry in entries {
-                let totalTokens = entry.inputTokens + entry.outputTokens + entry.cacheCreationTokens + entry.cacheReadTokens
-                dailyMap[entry.date, default: 0] += totalTokens
+            var mb = monthlyMap[e.month] ?? TokenBreakdown()
+            mb.input += e.inputTokens
+            mb.output += e.outputTokens
+            mb.cacheCreation += e.cacheCreationTokens
+            mb.cacheRead += e.cacheReadTokens
+            monthlyMap[e.month] = mb
+            monthlyCost[e.month, default: 0] += cost
+
+            var pb = projectMap[e.project] ?? TokenBreakdown()
+            pb.input += e.inputTokens
+            pb.output += e.outputTokens
+            pb.cacheCreation += e.cacheCreationTokens
+            pb.cacheRead += e.cacheReadTokens
+            projectMap[e.project] = pb
+            projectCost[e.project, default: 0] += cost
+
+            var mdb = modelMap[e.model] ?? TokenBreakdown()
+            mdb.input += e.inputTokens
+            mdb.output += e.outputTokens
+            mdb.cacheCreation += e.cacheCreationTokens
+            mdb.cacheRead += e.cacheReadTokens
+            modelMap[e.model] = mdb
+            modelCost[e.model, default: 0] += cost
+
+            if e.date == todayStr {
+                var tpb = todayProjectMap[e.project] ?? TokenBreakdown()
+                tpb.input += e.inputTokens
+                tpb.output += e.outputTokens
+                tpb.cacheCreation += e.cacheCreationTokens
+                tpb.cacheRead += e.cacheReadTokens
+                todayProjectMap[e.project] = tpb
+                todayProjectCost[e.project, default: 0] += cost
+
+                var tmb = todayModelMap[e.model] ?? TokenBreakdown()
+                tmb.input += e.inputTokens
+                tmb.output += e.outputTokens
+                tmb.cacheCreation += e.cacheCreationTokens
+                tmb.cacheRead += e.cacheReadTokens
+                todayModelMap[e.model] = tmb
+                todayModelCost[e.model, default: 0] += cost
+
+                todayBd.input += e.inputTokens
+                todayBd.output += e.outputTokens
+                todayBd.cacheCreation += e.cacheCreationTokens
+                todayBd.cacheRead += e.cacheReadTokens
             }
+        }
 
-            // Aggregate by month
-            var monthlyMap: [String: TokenBreakdown] = [:]
-            var monthlyCostMap: [String: Double] = [:]
-            for entry in entries {
-                var breakdown = monthlyMap[entry.month] ?? TokenBreakdown()
-                breakdown.input += entry.inputTokens
-                breakdown.output += entry.outputTokens
-                breakdown.cacheCreation += entry.cacheCreationTokens
-                breakdown.cacheRead += entry.cacheReadTokens
-                monthlyMap[entry.month] = breakdown
-                monthlyCostMap[entry.month, default: 0] += entry.costUSD
-            }
+        let daily = dailyMap.map { (date: $0.key, tokens: $0.value) }
+            .sorted { $0.date < $1.date }
+        let monthly = monthlyMap.map { (m, b) -> (month: String, cost: Double, details: TokenBreakdown) in
+            (month: m, cost: monthlyCost[m] ?? 0, details: b)
+        }.sorted { $0.month > $1.month }
+        let projects = projectMap.map { (p, b) -> ProjectData in
+            ProjectData(displayName: ProjectPath.displayName(p), originalName: p, cost: projectCost[p] ?? 0, details: b)
+        }.sorted { $0.details.total > $1.details.total }
+        let models = modelMap.map { (m, b) -> (model: String, cost: Double, details: TokenBreakdown) in
+            (model: m, cost: modelCost[m] ?? 0, details: b)
+        }.sorted { $0.details.total > $1.details.total }
+        let todayProjects = todayProjectMap.map { (p, b) -> ProjectData in
+            ProjectData(displayName: ProjectPath.displayName(p), originalName: p, cost: todayProjectCost[p] ?? 0, details: b)
+        }.sorted { $0.details.total > $1.details.total }
+        let todayModels = todayModelMap.map { (m, b) -> (model: String, cost: Double, details: TokenBreakdown) in
+            (model: m, cost: todayModelCost[m] ?? 0, details: b)
+        }.sorted { $0.details.total > $1.details.total }
 
-            // Aggregate by project (all time)
-            var projectMap: [String: TokenBreakdown] = [:]
-            var projectCostMap: [String: Double] = [:]
-            for entry in entries {
-                var breakdown = projectMap[entry.project] ?? TokenBreakdown()
-                breakdown.input += entry.inputTokens
-                breakdown.output += entry.outputTokens
-                breakdown.cacheCreation += entry.cacheCreationTokens
-                breakdown.cacheRead += entry.cacheReadTokens
-                projectMap[entry.project] = breakdown
-                projectCostMap[entry.project, default: 0] += entry.costUSD
-            }
+        let monthCost = monthlyCost[currentMonth] ?? 0
+        let totCost = monthlyCost.values.reduce(0, +)
+        let todayBdSnapshot = todayBd  // Swift 6: 闭包不能捕获 var
 
-            // Aggregate by model (all time)
-            var modelMap: [String: TokenBreakdown] = [:]
-            var modelCostMap: [String: Double] = [:]
-            for entry in entries {
-                var breakdown = modelMap[entry.model] ?? TokenBreakdown()
-                breakdown.input += entry.inputTokens
-                breakdown.output += entry.outputTokens
-                breakdown.cacheCreation += entry.cacheCreationTokens
-                breakdown.cacheRead += entry.cacheReadTokens
-                modelMap[entry.model] = breakdown
-                modelCostMap[entry.model, default: 0] += entry.costUSD
-            }
-
-            // Aggregate today's projects
-            var todayProjectMap: [String: TokenBreakdown] = [:]
-            var todayProjectCostMap: [String: Double] = [:]
-            var todayBreakdown = TokenBreakdown()
-            for entry in entries where entry.date == todayStr {
-                var breakdown = todayProjectMap[entry.project] ?? TokenBreakdown()
-                breakdown.input += entry.inputTokens
-                breakdown.output += entry.outputTokens
-                breakdown.cacheCreation += entry.cacheCreationTokens
-                breakdown.cacheRead += entry.cacheReadTokens
-                todayProjectMap[entry.project] = breakdown
-                todayProjectCostMap[entry.project, default: 0] += entry.costUSD
-
-                todayBreakdown.input += entry.inputTokens
-                todayBreakdown.output += entry.outputTokens
-                todayBreakdown.cacheCreation += entry.cacheCreationTokens
-                todayBreakdown.cacheRead += entry.cacheReadTokens
-            }
-
-            // Aggregate today's models
-            var todayModelMap: [String: TokenBreakdown] = [:]
-            var todayModelCostMap: [String: Double] = [:]
-            for entry in entries where entry.date == todayStr {
-                var breakdown = todayModelMap[entry.model] ?? TokenBreakdown()
-                breakdown.input += entry.inputTokens
-                breakdown.output += entry.outputTokens
-                breakdown.cacheCreation += entry.cacheCreationTokens
-                breakdown.cacheRead += entry.cacheReadTokens
-                todayModelMap[entry.model] = breakdown
-                todayModelCostMap[entry.model, default: 0] += entry.costUSD
-            }
-
-            // Convert to published arrays
-            self.dailyData = dailyMap.map { (date, tokens) in
-                (date: date, tokens: tokens)
-            }.sorted { $0.date < $1.date }
-
-            self.monthlyData = monthlyMap.map { (month, breakdown) in
-                let cost = monthlyCostMap[month] ?? self.calculateCost(breakdown)
-                return (month: month, cost: cost, details: breakdown)
-            }.sorted { $0.month > $1.month }
-
-            self.projectData = projectMap.map { (project, breakdown) in
-                let cost = projectCostMap[project] ?? self.calculateCost(breakdown)
-                return ProjectData(
-                    displayName: self.simplifyProjectName(project),
-                    originalName: project,
-                    cost: cost,
-                    details: breakdown
-                )
-            }.sorted { $0.details.total > $1.details.total }
-
-            self.modelData = modelMap.map { (model, breakdown) -> (model: String, cost: Double, details: TokenBreakdown) in
-                let cost = modelCostMap[model] ?? self.calculateCost(breakdown)
-                return (model: model, cost: cost, details: breakdown)
-            }.sorted { ($0.details.total) > ($1.details.total) }
-
-            // Today's data
-            self.todayProjectData = todayProjectMap.map { (project, breakdown) in
-                let cost = todayProjectCostMap[project] ?? self.calculateCost(breakdown)
-                return ProjectData(
-                    displayName: self.simplifyProjectName(project),
-                    originalName: project,
-                    cost: cost,
-                    details: breakdown
-                )
-            }.sorted { $0.details.total > $1.details.total }
-
-            self.todayModelData = todayModelMap.map { (model, breakdown) -> (model: String, cost: Double, details: TokenBreakdown) in
-                let cost = todayModelCostMap[model] ?? self.calculateCost(breakdown)
-                return (model: model, cost: cost, details: breakdown)
-            }.sorted { ($0.details.total) > ($1.details.total) }
-
-            self.todayBreakdown = todayBreakdown
-
-            // Calculate totals
-            let currentMonth = self.getCurrentMonthKey()
-            self.currentMonthCost = self.monthlyData.first(where: { $0.month == currentMonth })?.cost ?? 0.0
-            self.totalCost = self.monthlyData.reduce(0) { $0 + $1.cost }
-
-            self.dataSource = .local
+        await MainActor.run {
+            self.allEntries = entries
+            self.dailyData = daily
+            self.monthlyData = monthly
+            self.projectData = projects
+            self.modelData = models
+            self.todayProjectData = todayProjects
+            self.todayModelData = todayModels
+            self.todayBreakdown = todayBdSnapshot
+            self.currentMonthCost = monthCost
+            self.totalCost = totCost
             self.lastUpdate = Date()
             self.isLoading = false
-            self.onLoadingStateChanged?(false)
-            self.onDataUpdated?()
 
-            print("[UsageManager] Aggregation complete:")
-            print("  - Daily data: \(self.dailyData.count) days")
-            print("  - Monthly data: \(self.monthlyData.count) months")
-            print("  - Project data: \(self.projectData.count) projects")
-            print("  - Model data: \(self.modelData.count) models")
-            print("  - Today projects: \(self.todayProjectData.count)")
-            print("  - Today models: \(self.todayModelData.count)")
-            print("  - Total cost: $\(String(format: "%.4f", self.totalCost))")
+            umLogger.info("Published: \(daily.count) days, \(monthly.count) months, \(projects.count) projects, \(models.count) models")
         }
     }
 
     // MARK: - Helper Methods
+
+    /// 优先用日志里的 `costUSD`；若缺失（旧版 Claude Code 日志可能没有），
+    /// 按 entry 自己的 model 单价估算。绝不能用合并 breakdown × 单一单价 ——
+    /// 多模型混合会算错。
+    private func entryCost(_ e: UsageEntry) -> Double {
+        e.costUSD > 0 ? e.costUSD : PricingManager.calculateCost(
+            input: e.inputTokens,
+            cacheCreation: e.cacheCreationTokens,
+            cacheRead: e.cacheReadTokens,
+            output: e.outputTokens,
+            model: e.model
+        )
+    }
 
     private func getClaudePaths() -> [URL] {
         var paths: [URL] = []
@@ -578,7 +497,6 @@ class UsageManager: ObservableObject {
                 paths.append(xdgPath)
             }
         } else {
-            // Default XDG path
             let defaultXdgPath = homeDir.appendingPathComponent(".config/claude")
             if FileManager.default.fileExists(atPath: defaultXdgPath.appendingPathComponent("projects").path) {
                 paths.append(defaultXdgPath)
@@ -588,7 +506,6 @@ class UsageManager: ObservableObject {
         // Legacy ~/.claude directory
         let legacyPath = homeDir.appendingPathComponent(".claude")
         if FileManager.default.fileExists(atPath: legacyPath.appendingPathComponent("projects").path) {
-            // Avoid duplicates
             if !paths.contains(where: { $0.path == legacyPath.path }) {
                 paths.append(legacyPath)
             }
@@ -597,90 +514,39 @@ class UsageManager: ObservableObject {
         return paths
     }
 
+    /// 从 .../projects/{name}/... 路径里抽出 project 段。
+    /// 用 lastIndex 避免家目录路径里就含 "projects" 子段时取错。
+    /// e.g. /Users/x/projects/.config/claude/projects/foo/bar.jsonl → "foo"
+    private func extractProjectName(from fileURL: URL) -> String {
+        let parts = fileURL.pathComponents
+        if let idx = parts.lastIndex(of: "projects"), idx + 1 < parts.count {
+            return parts[idx + 1]
+        }
+        return "unknown"
+    }
+
     /// Format timestamp to YYYY-MM-DD using ccusage's approach
-    /// Uses Intl.DateTimeFormat equivalent in Swift
     private func formatDateFromTimestamp(_ timestamp: String) -> String {
-        // Try ISO8601 first
         if let date = iso8601Formatter.date(from: timestamp) {
-            let formatter = DateFormatter()
-            formatter.dateFormat = "yyyy-MM-dd"
-            formatter.locale = Locale(identifier: "en_CA") // en-CA gives YYYY-MM-DD format
-            return formatter.string(from: date)
+            return dayFormatter.string(from: date)
         }
 
-        // Try parsing with DateFormatter for various formats
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-
-        let formats = [
-            "yyyy-MM-dd'T'HH:mm:ssZ",
-            "yyyy-MM-dd'T'HH:mm:ss.SSSZ",
-            "yyyy-MM-dd'T'HH:mm:ss",
-            "yyyy-MM-dd"
-        ]
-
-        for format in formats {
-            formatter.dateFormat = format
-            if let date = formatter.date(from: timestamp) {
-                let outputFormatter = DateFormatter()
-                outputFormatter.dateFormat = "yyyy-MM-dd"
-                outputFormatter.locale = Locale(identifier: "en_CA")
-                return outputFormatter.string(from: date)
+        for parser in fallbackParsers {
+            if let date = parser.date(from: timestamp) {
+                return dayFormatter.string(from: date)
             }
         }
 
-        // Fallback: extract first 10 characters (YYYY-MM-DD)
+        // Fallback: take first 10 chars (YYYY-MM-DD)
         return String(timestamp.prefix(10))
     }
 
-    private func calculateCost(_ breakdown: TokenBreakdown) -> Double {
-        // Use pricing manager for cost calculation
-        let pricing = PricingManager.getPricing(for: "claude-sonnet-4-6")
-        let inputCost = Double(breakdown.input) * pricing.inputPrice / 1_000_000
-        let cacheCreationCost = Double(breakdown.cacheCreation) * pricing.cacheCreation / 1_000_000
-        let cacheReadCost = Double(breakdown.cacheRead) * pricing.cacheRead / 1_000_000
-        let outputCost = Double(breakdown.output) * pricing.outputPrice / 1_000_000
-        return inputCost + cacheCreationCost + cacheReadCost + outputCost
-    }
-
     private func getCurrentMonthKey() -> String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM"
-        return formatter.string(from: Date())
+        monthFormatter.string(from: Date())
     }
 
     private func getCurrentDateKey() -> String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd"
-        return formatter.string(from: Date())
-    }
-
-    private func simplifyProjectName(_ projectName: String) -> String {
-        if projectName.isEmpty || projectName == "unknown" {
-            return "Unknown Project"
-        }
-
-        if !projectName.hasPrefix("-Users-") {
-            return projectName
-        }
-
-        // 1. 先把连续的 - 替换成单个 -
-        var path = projectName
-        while path.contains("--") {
-            path = path.replacingOccurrences(of: "--", with: "-")
-        }
-
-        // 2. 把 - 替换成 /
-        path = path.replacingOccurrences(of: "-", with: "/")
-
-        // 3. 删除开头多余的 /
-        if path.hasPrefix("/") {
-            path = String(path.dropFirst())
-        }
-
-        // 4. 按 / 分割，取最后一个作为项目名
-        let parts = path.components(separatedBy: "/").filter { !$0.isEmpty }
-        return parts.last ?? projectName
+        dayFormatter.string(from: Date())
     }
 
     // MARK: - Filter by Month
@@ -712,15 +578,14 @@ class UsageManager: ObservableObject {
             breakdown.cacheCreation += entry.cacheCreationTokens
             breakdown.cacheRead += entry.cacheReadTokens
             projectMap[entry.project] = breakdown
-            projectCostMap[entry.project, default: 0] += entry.costUSD
+            projectCostMap[entry.project, default: 0] += entryCost(entry)
         }
 
         return projectMap.map { (project, breakdown) in
-            let cost = projectCostMap[project] ?? self.calculateCost(breakdown)
-            return ProjectData(
-                displayName: self.simplifyProjectName(project),
+            ProjectData(
+                displayName: ProjectPath.displayName(project),
                 originalName: project,
-                cost: cost,
+                cost: projectCostMap[project] ?? 0,
                 details: breakdown
             )
         }.sorted { $0.details.total > $1.details.total }
@@ -743,12 +608,11 @@ class UsageManager: ObservableObject {
             breakdown.cacheCreation += entry.cacheCreationTokens
             breakdown.cacheRead += entry.cacheReadTokens
             modelMap[entry.model] = breakdown
-            modelCostMap[entry.model, default: 0] += entry.costUSD
+            modelCostMap[entry.model, default: 0] += entryCost(entry)
         }
 
         return modelMap.map { (model, breakdown) -> (model: String, cost: Double, details: TokenBreakdown) in
-            let cost = modelCostMap[model] ?? self.calculateCost(breakdown)
-            return (model: model, cost: cost, details: breakdown)
+            (model: model, cost: modelCostMap[model] ?? 0, details: breakdown)
         }.sorted { ($0.details.total) > ($1.details.total) }
     }
 
