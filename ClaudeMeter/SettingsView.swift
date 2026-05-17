@@ -11,8 +11,9 @@ struct SettingsView: View {
     @State private var notificationStatus: String = "检查中..."
     @State private var notificationsDenied: Bool = false
     var onBack: (() -> Void)? = nil
-    /// 外观切换「之前」回调 —— 让 PopoverView 抓旧外观快照做 crossfade。
-    var onAppearanceWillChange: (() -> Void)? = nil
+    /// 外观选择回调 —— 把目标值交给 PopoverView 统一编排（截图 → 切外观 → 波纹）。
+    /// SettingsView 自己不写 settings.appearance，避免截图与切换抢同一帧导致闪屏。
+    var onAppearanceChange: ((Int) -> Void)? = nil
 
     var body: some View {
         VStack(spacing: 0) {
@@ -104,7 +105,7 @@ struct SettingsView: View {
                             title: "外观",
                             options: settings.appearanceOptions,
                             selectedValue: $settings.appearance,
-                            onWillChange: onAppearanceWillChange
+                            onPick: onAppearanceChange
                         )
 
                         Divider().background(Theme.Colors.divider)
@@ -418,8 +419,9 @@ struct SettingsPickerRow: View {
     let title: String
     let options: [(value: Int, label: String)]
     @Binding var selectedValue: Int
-    /// 值「即将」改变时回调（在写入新值之前）。仅当值真的不同才触发。
-    var onWillChange: (() -> Void)? = nil
+    /// 选中某项时的拦截回调。提供时由调用方决定何时写入新值（用于外观切换的
+    /// 截图编排）；不提供时直接写 selectedValue（普通行为）。
+    var onPick: ((Int) -> Void)? = nil
 
     var body: some View {
         HStack {
@@ -431,8 +433,11 @@ struct SettingsPickerRow: View {
                 ForEach(options, id: \.value) { option in
                     Button {
                         if selectedValue != option.value {
-                            onWillChange?()
-                            selectedValue = option.value
+                            if let onPick {
+                                onPick(option.value)
+                            } else {
+                                selectedValue = option.value
+                            }
                         }
                     } label: {
                         Text(option.label)

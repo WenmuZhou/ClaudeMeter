@@ -1,26 +1,29 @@
 # ClaudeMeter
 
 <p align="center">
-  <strong>A minimal and elegant Claude Code usage tracker</strong>
+  <strong>简洁优雅的 Claude Code 用量追踪工具</strong>
 </p>
 
 <p align="center">
-  Monitor your Claude Code token usage in real-time from the macOS menu bar
+  在 macOS 菜单栏实时监控你的 Claude Code Token 用量
 </p>
 
 
-## Features
+## 功能特性
 
-- **Real-time Monitoring** - Display token usage directly in the status bar
-- **Today/History Views** - Switch between today's data and historical records
-- **Visual Charts** - Daily trend bar chart and historical line chart
-- **Project/Model Statistics** - Token usage breakdown by project and model
-- **Monthly Filtering** - Filter historical data by month
-- **Desktop Notifications** - Test notification support
-- **Launch at Login** - Optional auto-start on login
-- **Auto Refresh** - Configurable refresh intervals
+- **实时监控** —— 在状态栏直接显示 Token 用量
+- **今日 / 历史视图** —— 在今日数据和历史记录之间切换
+- **可视化图表** —— 每日趋势柱状图 + 历史折线图，鼠标悬停显示该点的具体数据
+- **灵活的历史维度** —— 历史折线图支持按月 / 周 / 日汇总，数据较多时可左右滑动
+- **项目 / 模型统计** —— 按项目和模型拆分 Token 用量
+- **按月筛选** —— 按月份筛选历史数据
+- **持久化存储** —— 解析后的日志存入本地数据库，重启无需重新解析，每次扫描均为增量
+- **深色 / 浅色模式** —— 可跟随系统，也可固定浅色 / 深色，切换时带波纹过渡动画
+- **桌面通知** —— 可选的桌面通知支持
+- **开机自启** —— 可选登录时自动启动
+- **自动刷新** —— 刷新间隔可配置
 
-## Screenshots
+## 截图
 
 <p align="center">
   <img src="imgs/today.jpg" width="260">
@@ -28,86 +31,93 @@
   <img src="imgs/setting.jpg" width="260">
 </p>
 
-## Requirements
+## 环境要求
 
-- macOS 14.0 (Sonoma) or later
-- Claude Code installed and used
+- macOS 14.0 (Sonoma) 或更高版本
+- 已安装并使用过 Claude Code
 
-## Installation
+## 安装
 
-### Option 1: Download
+### 方式一：下载
 
-1. Download `ClaudeMeter-v1.0.0-macos-arm64.zip` from [Releases](https://github.com/WenmuZhou/ClaudeMeter/releases)
-2. Unzip and move `ClaudeMeter.app` to your Applications folder
-3. On first launch, right-click → Open (to bypass Gatekeeper)
+1. 从 [Releases](https://github.com/WenmuZhou/ClaudeMeter/releases) 下载最新版本
+2. 解压后将 `ClaudeMeter.app` 移动到「应用程序」文件夹
+3. 首次启动时右键点击 → 打开（以绕过 Gatekeeper）
 
-### Option 2: Build from Source
+### 方式二：从源码构建
 
 ```bash
-# Clone the repository
+# 克隆仓库
 git clone https://github.com/WenmuZhou/ClaudeMeter.git
 cd ClaudeMeter
 
-# Build with the script
+# 用脚本构建（产物 ClaudeMeter.app 输出到项目根目录）
 ./build.sh
 
-# Or build manually with Xcode
+# 或用 Xcode 手动构建
 # open ClaudeMeter.xcodeproj
-# Press Cmd+R to run
+# 按 Cmd+R 运行
 ```
 
-## Data Source
+## 数据来源
 
-ClaudeMeter reads directly from Claude Code local log files:
+ClaudeMeter 直接读取 Claude Code 的本地日志文件：
 
-- `~/.claude/projects/` (default path)
-- `~/.config/claude/projects/` (XDG standard)
-- Including subagents subdirectories
+- `~/.claude/projects/`（默认路径）
+- `~/.config/claude/projects/`（XDG 标准路径）
+- 包含 subagents 子目录
 
-All data processing happens locally. No API keys needed, no data leaves your computer.
+解析后的记录会缓存进本地 SwiftData 数据库，因此 app 启动即用，每次刷新只扫描新变更的日志文件。所有数据处理均在本地完成，无需 API Key，数据不会离开你的电脑。
 
-## Settings
+## 设置项
 
-| Setting | Description |
-|---------|-------------|
-| Launch at Login | Automatically start the app on login |
-| Auto Refresh | Automatically refresh usage data |
-| Refresh Interval | Set the auto-refresh time interval |
-| Status Bar Display | Show today's or total tokens |
-| Number Format | K/M format or 万/千万 format |
-| Enable Notifications | Turn on desktop notifications |
+| 设置 | 说明 |
+|------|------|
+| 外观 | 跟随系统，或固定浅色 / 深色 |
+| 开机自启 | 登录时自动启动 app |
+| 自动刷新 | 自动刷新用量数据 |
+| 刷新间隔 | 设置自动刷新的时间间隔 |
+| 状态栏显示 | 显示今日或累计 Token |
+| 数字格式 | K/M 格式或 万/千万 格式 |
+| 启用通知 | 开启桌面通知 |
 
-## Development
+## 开发
 
-### Project Structure
+### 项目结构
 
 ```
 ClaudeMeter/
 ├── ClaudeMeter/
-│   ├── ClaudeMeterApp.swift      # App entry point
-│   ├── PopoverView.swift         # Main UI
-│   ├── UsageManager.swift        # Data management
-│   ├── StatusBarController.swift # Status bar control
-│   ├── SettingsView.swift        # Settings UI
-│   ├── SettingsManager.swift     # Settings storage
-│   └── PricingManager.swift      # Pricing calculation
+│   ├── ClaudeMeterApp.swift      # App 入口
+│   ├── StatusBarController.swift # 菜单栏图标与 popover 控制
+│   ├── PopoverView.swift         # 主界面
+│   ├── SettingsView.swift        # 设置界面
+│   ├── UsageManager.swift        # 用量数据加载与聚合
+│   ├── DataStore.swift           # SwiftData 持久化（增量扫描）
+│   ├── SettingsManager.swift     # 设置存储
+│   ├── PricingManager.swift      # 价格计算
+│   ├── Theme.swift               # 设计 token（颜色、字体、间距）
+│   ├── Color+Hex.swift           # 颜色工具（hex 与浅/深自适应）
+│   ├── ProjectPath.swift         # 项目路径解码
+│   └── Logging.swift             # 统一日志
 ├── ClaudeMeter.xcodeproj/
 ├── imgs/
 ├── build.sh
 └── README.md
 ```
 
-### Tech Stack
+### 技术栈
 
 - Swift / SwiftUI
+- SwiftData（本地持久化）
 - NSStatusItem / NSPopover
 - Combine
 - UserNotifications
 
-## Acknowledgments
+## 致谢
 
-Data extraction logic inspired by [ccusage](https://github.com/ryoppippi/ccusage).
+数据提取逻辑参考自 [ccusage](https://github.com/ryoppippi/ccusage)。
 
-## License
+## 许可证
 
 MIT

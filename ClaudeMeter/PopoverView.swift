@@ -45,23 +45,34 @@ struct PopoverView: View {
     @State private var hoveredBarIndex: Int? = nil
     @State private var hoveredLineIndex: Int? = nil
 
-    // 日夜模式切换的交叉淡出：切换前把旧外观渲染成快照盖在最上层，
-    // 底下内容瞬切到新外观，再把快照淡出 → 视觉上是 crossfade。
+    // 日夜模式切换的波纹揭示：切换前把屏幕当前画面截成快照盖在最上层，底下内容瞬切
+    // 到新外观，再用一个从右上角扩张的圆把快照「擦掉」→ 新主题像波纹般从右上角涌入。
     @State private var transitionSnapshot: Image?
-    @State private var snapshotOpacity: Double = 1
+    /// 揭示进度：0 = 快照完整覆盖，1 = 快照被波纹完全擦除（露出新外观）。
+    @State private var revealProgress: CGFloat = 0
     /// 防止用户快速连切外观时，旧的清理任务提前清掉新快照。
     @State private var transitionToken: Int = 0
-    @Environment(\.colorScheme) private var currentScheme
-    @Environment(\.displayScale) private var displayScale
+    /// 截屏器：抓 popover 内容视图的真实像素。比 ImageRenderer 可靠——后者渲染
+    /// ScrollView 内容会得到空白（浅色下就是一闪的白屏）。
+    @State private var snapshotter = PopoverSnapshotter()
+    /// 系统外观变化的计数器：仅用于在「跟随系统」模式下触发 body 重算 effectiveScheme。
+    @State private var systemAppearanceTick: Int = 0
 
-    /// 把 settings.appearance 映射为 SwiftUI 的 ColorScheme。
-    /// 0 = 跟随系统（返回 nil，preferredColorScheme(nil) 表示不强制），
-    /// 1 = 浅色，2 = 深色。
-    private var preferredScheme: ColorScheme? {
+    /// 当前应当生效的配色。永远返回具体值（不返回 nil）。
+    ///
+    /// 用 `preferredColorScheme`（视图级、瞬切、无动画）而非 `NSApp.appearance`
+    /// （窗口级、会触发 AppKit 自带的淡入淡出，把我们的波纹动画盖掉）。
+    /// 「系统」模式不返回 nil —— `preferredColorScheme(nil)` 在 NSPopover 上从浅/深
+    /// 切回系统时不会重置，会卡死在上次外观；改为读真实系统外观映射成具体值。
+    private var effectiveScheme: ColorScheme {
+        _ = systemAppearanceTick  // 建立依赖：系统深浅色变化时随之重算
         switch settings.appearance {
         case 1: return .light
         case 2: return .dark
-        default: return nil
+        default:
+            // 系统：我们从不覆盖 NSApp.appearance，effectiveAppearance 即系统外观。
+            let match = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua])
+            return match == .darkAqua ? .dark : .light
         }
     }
 
@@ -195,7 +206,7 @@ struct PopoverView: View {
                         showSettings = false
                     }
                 },
-                onAppearanceWillChange: { snapshotForTransition() }
+                onAppearanceChange: { handleAppearanceChange($0) }
             )
             .frame(width: 360, height: 540)
             .offset(x: showSettings ? 0 : 360)
@@ -204,68 +215,96 @@ struct PopoverView: View {
         // 整个 popover 统一用 bgCard（跟"今日使用"等卡片同色），让中间区与卡片融为一体。
         .background(Theme.Colors.bgCard)
         .clipped()
+        // 0 尺寸锚点视图：让 snapshotter 能定位到 popover 窗口、截真实像素。
+        .background(AnchorViewReader(snapshotter: snapshotter))
     }
 
     var body: some View {
         mainContent
-            // 旧外观快照盖在最上层，淡出时露出底下的新外观 → crossfade
+            // 旧外观快照盖在最上层，被右上角扩张的圆形波纹擦除，露出底下的新外观。
             .overlay {
                 if let snap = transitionSnapshot {
                     snap
                         .resizable()
                         .frame(width: 360, height: 540)
-                        .opacity(snapshotOpacity)
+                        .mask(revealMask)
                         .allowsHitTesting(false)
                 }
             }
-            // 应用用户的外观偏好；nil 表示跟随系统。
-            .preferredColorScheme(preferredScheme)
+            // 视图级配色（瞬切、无 AppKit 淡入淡出，波纹动画才不会被盖掉）。
+            .preferredColorScheme(effectiveScheme)
+            // 系统深浅色变化时（仅「跟随系统」模式有意义）触发 effectiveScheme 重算。
+            .onReceive(
+                DistributedNotificationCenter.default().publisher(
+                    for: Notification.Name("AppleInterfaceThemeChangedNotification")
+                )
+            ) { _ in
+                systemAppearanceTick &+= 1
+            }
             // 只在 viewMode / 周期 / 数据更新时重算图表数据，避免 hover 高频重绘反复聚合。
             .onChange(of: chartDataTrigger, initial: true) { _, _ in
                 chartData = computeChartData()
             }
     }
 
-    /// 在切换外观「之前」调用：把当前（旧）外观渲染成静态快照，盖在最上层后淡出。
+    /// 外观切换的总编排。分三个 runloop tick 严格排序，杜绝「先闪一下」：
+    ///   ① 截旧外观快照、progress=0 盖住画面 —— 此 tick 不动 settings.appearance；
+    ///   ② 下一拍才真正切外观 —— 此时快照已提交并完整覆盖，瞬切被挡得严严实实；
+    ///   ③ 再下一拍启动波纹揭示，把快照擦掉露出新外观。
+    /// 之前截图和切外观挤在同一帧，无法保证快照先提交到屏幕 → 新外观会先露一帧。
     @MainActor
-    private func snapshotForTransition() {
-        let renderer = ImageRenderer(
-            content: mainContent.environment(\.colorScheme, currentScheme)
-        )
-        renderer.scale = displayScale
+    private func handleAppearanceChange(_ newValue: Int) {
+        guard newValue != settings.appearance else { return }
 
-        // 关键：ImageRenderer 解析 Color(light:dark:) 背后的动态 NSColor 时，依据的是
-        // 渲染那一刻生效的 NSAppearance，而不是注入的 SwiftUI colorScheme。若不强制，
-        // 快照颜色会错（深色→浅色时快照渲成浅色，直接盖在深色屏上 = 一次硬闪）。
-        // 用 performAsCurrentDrawingAppearance 把旧外观设为当前绘制外观，再取 .nsImage。
-        let oldAppearance = NSAppearance(named: currentScheme == .dark ? .darkAqua : .aqua)
-        var rendered: NSImage?
-        if let oldAppearance {
-            oldAppearance.performAsCurrentDrawingAppearance {
-                rendered = renderer.nsImage
-            }
-        } else {
-            rendered = renderer.nsImage
+        // ① 截当前屏幕——cacheDisplay 抓的是 popover 内容视图的真实像素，
+        // 旧外观、ScrollView 内容、滚动位置全都一致，不存在 ImageRenderer 的空白问题。
+        guard let snapshot = snapshotter.snapshotImage() else {
+            // 截图失败：放弃动画，直接切，至少功能正确。
+            settings.appearance = newValue
+            return
         }
-        guard let nsImage = rendered else { return }
 
         transitionToken &+= 1
         let token = transitionToken
-        snapshotOpacity = 1
-        transitionSnapshot = Image(nsImage: nsImage)
+        revealProgress = 0
+        transitionSnapshot = snapshot
 
-        // 下一拍再启动淡出，确保快照先以满不透明度渲染一帧、完整盖住瞬切。
+        // ② 下一拍：快照已渲染并完整覆盖屏幕，此刻切外观，底下瞬切完全不可见。
         DispatchQueue.main.async {
-            withAnimation(.easeInOut(duration: 0.4)) {
-                self.snapshotOpacity = 0
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
-                // 期间又触发了新的切换则跳过，避免提前清掉新快照。
-                if self.transitionToken == token {
-                    self.transitionSnapshot = nil
+            self.settings.appearance = newValue
+
+            // ③ 再下一拍：启动波纹揭示。
+            DispatchQueue.main.async {
+                withAnimation(.easeInOut(duration: 0.55)) {
+                    self.revealProgress = 1
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                    // 期间又触发了新切换则跳过，避免提前清掉新快照。
+                    if self.transitionToken == token {
+                        self.transitionSnapshot = nil
+                    }
                 }
             }
         }
+    }
+
+    /// 旧外观快照的遮罩：一个从右上角扩张的圆把快照「擦掉」，露出底下的新外观。
+    /// 圆边做柔化 → 波前像水波纹般晕开，而不是生硬的圆形擦除。
+    private var revealMask: some View {
+        // 圆心在右上角 (360, 0)，要覆盖到左下角需半径 ≥ √(w²+h²)；多留 30pt 给柔化边缘。
+        let maxRadius = (360.0 * 360.0 + 540.0 * 540.0).squareRoot() + 30
+        let diameter = maxRadius * 2 * revealProgress
+        return Rectangle()
+            .fill(Color.black)
+            .overlay {
+                Circle()
+                    .fill(Color.black)
+                    .frame(width: diameter, height: diameter)
+                    .blur(radius: 12)            // 柔化波前
+                    .position(x: 360, y: 0)      // 右上角
+                    .blendMode(.destinationOut)  // 在快照上「打洞」，洞内露出新外观
+            }
+            .compositingGroup()
     }
 
     // MARK: - Header
@@ -1090,6 +1129,46 @@ struct PopoverView: View {
         if lower.contains("qwen") { return Theme.Colors.modelQwen }
         if lower.contains("pitaya") { return Theme.Colors.modelPitaya }
         return Theme.Colors.modelOther
+    }
+}
+
+// MARK: - Live Popover Snapshot
+
+/// 抓 popover 内容视图当前像素的截屏器。
+///
+/// 用 `NSView.cacheDisplay` 而非 `ImageRenderer`：后者渲染含 `ScrollView` 的视图树
+/// 经常得到空白内容（在浅色外观下表现为切换时一闪的白屏）。cacheDisplay 截的是
+/// 屏幕上真实显示的像素，外观、内容、滚动位置全都一致。
+@MainActor
+final class PopoverSnapshotter {
+    /// 插在 SwiftUI 树里的锚点 NSView，靠它的 window 定位 popover 内容视图。
+    fileprivate weak var anchorView: NSView?
+
+    /// 截当前 popover 内容视图 —— 像素级精确，就是此刻屏幕上真实显示的样子。
+    func snapshotImage() -> Image? {
+        guard let content = anchorView?.window?.contentView else { return nil }
+        let bounds = content.bounds
+        guard bounds.width > 1, bounds.height > 1,
+              let rep = content.bitmapImageRepForCachingDisplay(in: bounds) else { return nil }
+        content.cacheDisplay(in: bounds, to: rep)
+        let image = NSImage(size: bounds.size)
+        image.addRepresentation(rep)
+        return Image(nsImage: image)
+    }
+}
+
+/// 把一个 0 尺寸 NSView 插进 SwiftUI 树，仅用于让 PopoverSnapshotter 拿到 popover 窗口。
+private struct AnchorViewReader: NSViewRepresentable {
+    let snapshotter: PopoverSnapshotter
+
+    func makeNSView(context: Context) -> NSView {
+        let v = NSView(frame: .zero)
+        snapshotter.anchorView = v
+        return v
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        snapshotter.anchorView = nsView
     }
 }
 
